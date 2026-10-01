@@ -10,6 +10,7 @@ Gejala → sebab → solusi. Untuk panduan pemakaian umum lihat
 | Gejala | Penyebab & Solusi |
 |---|---|
 | `Segmentation fault` saat masuk shell | Readline crash. **Solved** — default pakai `--noediting`. Paksa: `cng --shell dash` |
+| `Segmentation fault` saat jalanin `opencode` | **Bug chroot-ng, terkonfirmasi** — `rc=139` deterministik. Pakai proot, lihat §2 |
 | `dipanggil dari dalam proot` | chroot-ng tidak bisa nested. `exit` dulu ke shell Termux |
 | `rootfs 'debian' tidak ada` | Container hilang. `proot-distro list` untuk cek |
 | `bad interpreter` | bash belum ada di Termux. `pkg install bash` |
@@ -19,14 +20,14 @@ Gejala → sebab → solusi. Untuk panduan pemakaian umum lihat
 | `command not found: python3` | Hanya ada `python3.13`. `ln -s /usr/bin/python3.13 /usr/bin/python3` |
 | `--list` menampilkan distro yang rusak | Sudah diperbaiki: wrapper cek isi rootfs, bukan cuma `isdir` |
 | Tidak ada output di mode perintah | Sudah diperbaiki: ganti process substitution ke temp file |
-| `PATH` memuat `/data/data/com.termux/...` | Profile proot bocor ke guest. Sudah ada guard, lihat §6 |
-| `container=proot-distro` di dalam chroot-ng | Gejala yang sama. Guard di §6 meng-unset-nya |
-| `Permission denied` saat `uv sync` / `hermes` | Symlink `.l2s` proot menunjuk path host. **Solved** — 22.123 symlink di-rewrite, lihat §8 |
+| `PATH` memuat `/data/data/com.termux/...` | Profile proot bocor ke guest. Sudah ada guard, lihat §7 |
+| `container=proot-distro` di dalam chroot-ng | Gejala yang sama. Guard di §7 meng-unset-nya |
+| `Permission denied` saat `uv sync` / `hermes` | Symlink `.l2s` proot menunjuk path host. **Solved** — 22.123 symlink di-rewrite, lihat §9 |
 | `ImportError: cannot import name 'YAML'` | Akibat dari baris di atas: `uv sync` gagal jadi `site-packages` kosong |
 | `ls .l2s` selalu 0 padahal file ada | Normal — isinya dotfile `.l2s.*`. Pakai `ls -a` |
-| `error: Error building trees` / `garbage: N` | `link2symlink` proot merusak `.git/objects`. Clone ulang, lihat §8 |
+| `error: Error building trees` / `garbage: N` | `link2symlink` proot merusak `.git/objects`. Clone ulang, lihat §9 |
 | `Segmentation fault` saat jalanin `opencode` | **Belum jelas.** Tidak ter-reproduksi dengan harness valid. Curigai memori: 209 MB free, binary 199 MB |
-| `python3` di proot berperilaku aneh | `python3` di `proot-distro login` itu **bionic Termux**, bukan glibc. Lihat §9 |
+| `python3` di proot berperilaku aneh | `python3` di `proot-distro login` itu **bionic Termux**, bukan glibc. Lihat §10 |
 
 ---
 
@@ -77,7 +78,99 @@ cng --shell dash
 
 ---
 
-## 2. Error-option wrapper
+## 2. `Segmentation fault` saat menjalankan `opencode`
+
+> **Status: bug chroot-ng TERKONFIRMASI, reproduksi deterministik.**
+> Penyebab root belum ditemukan. Sementara ini: **jangan jalankan `opencode`
+> di bawah chroot-ng** — pakai proot.
+
+### Gejala
+
+```
+$ cng
+root@localhost:~# opencode
+Segmentation fault
+root@localhost:~#
+```
+
+### Reproduksi
+
+Tidak butuh TTY. Cukup perintah non-interaktif:
+
+```console
+$ cng '/root/.opencode/bin/opencode models </dev/null >/dev/null 2>&1; echo $?'
+139
+```
+
+| Perintah | chroot-ng | proot |
+|---|---|---|
+| `opencode --version` | `rc=0` ✅ | `rc=0` ✅ |
+| `opencode --help` | `rc=0` ✅ | `rc=0` ✅ |
+| `opencode run --help` | `rc=0` ✅ | — |
+| `opencode auth --help` | `rc=0` ✅ | — |
+| **`opencode models`** | **`rc=139` (SIGSEGV)** | **`rc=0`** ✅ |
+
+`139` = `128 + 11` = `SIGSEGV`. Diulang 5 dari 5, dan 2 dari 2 di terminal
+asli. **Tidak ada race, tidak ada acak.**
+
+Pola ini penting: yang ringan jalan, yang mulai kerja serius tidak. `--version`
+hanya membaca header binary; begitu program benar-benar menjalankan logika,
+ia mati.
+
+### Yang sudah dibantah (jangan ulangi arah ini)
+
+| Hipotesis | Cara disprove | Hasil |
+|---|---|---|
+| Tekanan memori | crash deterministik; `node`/`git`/`bash` jalan semua | **bukan** |
+| `clone3` / thread | `python3` `threading` + `node` `worker_threads` | `THREAD-OK`, `WORKER-OK` |
+| `mprotect` / `execmem` | ukur nilai balik & errno via `ctypes`, 6 putaran | identik proot vs chroot-ng, 6/6 `ret=0` |
+| `ENETDOWN` di trace | `mprotect` nyata tidak menghasilkan errno itu | **artefak strace di bawah seccomp** |
+| Wrapper / `PATH` tercemar | `--version` justru jalan | bukan itu |
+
+> `ENETDOWN` (=100) muncul 26 kali di `strace` dan sempat terlihat seperti
+>Smoking gun. Nyatanya `mprotect` di kedua engine sama-sama `ret=0`. Kalau
+> `-f -o` dipakai di bawah seccomp chroot-ng, nilai balik syscall bisa salah
+> tampil — jangan percaya `strace` untuk nilai return di sini.
+
+### Petunjuk terbaru
+
+`opencode` bukan single-process; ia me-spawn **server** sendiri. Dengan
+`HOME` kosong error-nya jadi berbeda:
+
+```
+Error: Server process exited with code 127
+    at service.ensure (/$bunfs/root/chunk-58ykr4dx.js:3:732)
+```
+
+`127` = "command not found" — server-nya tidak ditemukan karena konfigurasi
+hilang. Dengan `HOME` asli, server **ditemukan**, lalu **crash 139**. Jadi
+yang mati adalah subproses server, bukan client-nya.
+
+Ini masih petunjuk, belum jawaban. Yang belum diperiksa: apa persis yang
+di-`execve` saat spawn, dan apakah `opencode serve` sendiri bisa hidup.
+
+### Untuk mereproduksi ulang
+
+```bash
+bash $PREFIX/tmp/repro-opencode.sh
+```
+
+Keluar 0 = bug terkonfirmasi. Keluar 1 = tidak tereproduksi (kemungkinan sudah
+diperbaiki chroot-ng).
+
+### Yang bisa dilakukan sekarang
+
+Jalankan `opencode` lewat **proot**:
+
+```bash
+proot-distro login debian
+```
+
+`opencode` tetap jalan normal di sana. Yang bermasalah hanya `chroot-ng`.
+
+---
+
+## 3. Error-option wrapper
 
 ### 2.1 `cannot load -b (.../rootfs/-b)`
 
@@ -108,7 +201,7 @@ Keduanya harus kosong.
 
 ---
 
-## 3. Noise stderr yang bukan error
+## 4. Noise stderr yang bukan error
 
 ```
 chroot-ng: syscall 99 not permitted here -> emulated
@@ -136,7 +229,7 @@ cng --raw 'echo halo'
 
 ---
 
-## 4. Locale
+## 5. Locale
 
 ### Gejala
 
@@ -164,7 +257,7 @@ cng 'apt install locales && locale-gen en_US.UTF-8'
 
 ---
 
-## 5. `python3` tidak ditemukan
+## 6. `python3` tidak ditemukan
 
 **Sebab:** Debian 13 hanya menyediakan `python3.13`, tanpa symlink generik.
 
@@ -178,7 +271,7 @@ Tidak mendesak kalau app-mu (mis. Hermes via `uv`) sudah pakai path lengkap.
 
 ---
 
-## 6. `PATH` terkontaminasi bionic
+## 7. `PATH` terkontaminasi bionic
 
 ### Gejala
 
@@ -261,7 +354,7 @@ cng 'printenv PATH' | tr ':' '\n' | grep termux
 
 ---
 
-## 7. `run-as` — akses Termux dari adb
+## 8. `run-as` — akses Termux dari adb
 
 Temuan yang tidak terduga saat debugging: shell adb (`uid 2000`) **tidak bisa** baca
 data app Termux. Tapi kalau aplikasi Termux-mu `debuggable`, `run-as` memberi
@@ -289,7 +382,7 @@ Kenapa ini penting: `/data/local/tmp` ber-mode `drwxrwx--x shell shell`, jadi
 
 ---
 
-## 8. `Permission denied` saat `uv sync` / `hermes`
+## 9. `Permission denied` saat `uv sync` / `hermes`
 
 ### Gejala
 
@@ -442,7 +535,7 @@ beracting di dalam rootfs — repo di `$HOME` Termux tidak kena.
 
 ---
 
-## 9. Diagnosis manual
+## 10. Diagnosis manual
 
 Kalau perlu menelusuri sendiri, tiga perintah ini paling berguna:
 
@@ -471,7 +564,7 @@ alamat fault yang berguna.
 
 ### Cara menguji dengan benar (hemat waktu)
 
-Pengujian lewat `adb shell` **wajib** lewat `run-as com.termux` (§7), bukan
+Pengujian lewat `adb shell` **wajib** lewat `run-as com.termux` (§8), bukan
 shell adb biasa. Alasannya: `/data/local/tmp` mode `drwxrwx--x shell shell`,
 jadi `uid 2000` tidak bisa membacanya, dan tidak bisa menyentuh `$PREFIX`.
 
@@ -533,7 +626,7 @@ sebut ini sebagai penyebab sebelum ada datanya.
 
 ---
 
-## 10. Kalau semuanya gagal
+## 11. Kalau semuanya gagal
 
 Kembali ke proot — tidak ada yang hilang, rootfs-nya sama persis:
 

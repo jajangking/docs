@@ -184,7 +184,8 @@ Semua ini diuji di rootfs Debian asli perangkat ini, bukan rootfs uji:
 | symlink `.l2s` | 0 tersisa dari 22.123 yang sebelumnya rusak (lihat §6) |
 | `hermes --version` | `Hermes Agent v0.21.5+5355.g357f51c` |
 | `opencode --version` | `v2.0.21` |
-| `opencode` TUI interaktif | 5/5 lolos, tanpa signal |
+| `opencode` TUI interaktif | 5/5 lolos (ternyata sia-sia — `marker=OK` hanya berarti `echo` tercetak, bukan opencode sukses) |
+| `opencode models` | **GAGAL** — `rc=139` SIGSEGV di chroot-ng, `rc=0` di proot |
 | mode perintah | stabil, noise stderr terfilter |
 | shell interaktif | aman dengan `--noediting` |
 
@@ -380,28 +381,58 @@ cng --editing
 | Item | Status |
 |---|---|
 | Angka proot vs chroot-ng yang valid | **belum** — yang pernah diukur salah karena di dalam proot |
-| Penyebab segfault `opencode` | **belum** — tidak ter-reproduksi dengan harness valid (5/5 lolos). Hipotesis: tekanan memori. Belum diuji |
+| Penyebab segfault `opencode` | **terkonfirmasi ada**, tapi akar masalahnya belum ditemukan. Lihat §2 di troubleshooting |
 | Penyebab segfault readline | **belum** didapat alamat crash (`strace` tidak menangkap `SIGSEGV`) |
 | Bug `-Werror` di `unistd_check.c` | **belum** dikirim sebagai PR upstream |
 | `strace` + core dump | sudah terinstall di rootfs, tapi belum menghasilkan core yang berguna |
 | Test GPU (`vulkaninfo`) | **belum** dikerjakan |
 | Symlink `python3` → `python3.13` | **belum** — tidak mendesak, `hermes` punya python sendiri |
 
-### Tidak ter-reproduksi ≠ selesai
+### `opencode` tidak bisa dipakai di bawah chroot-ng
 
-`opencode` sempat keluar `Segmentation fault` sekali di shell interaktif. Setelah
-harness diperbaiki (§9 di [troubleshooting.md](troubleshooting.md)), crash itu
-tidak muncul lagi dalam 5 percobaan — termasuk TUI di interaktif.
+Ini **bukan** lagi "belum jelas". Sekarang terkonfirmasi:
 
-Itu **belum berarti selesai**. Harness-nya pty sintetis, bukan terminal Termux
-asli, dan kondisi device saat crash tidak terekam. Yang diketahui hanya: tidak
-ada bukti chroot-ng penyebabnya. Sumber lain yang masuk akal secara fisik:
+```
+opencode --version   →  rc=0     (chroot-ng dan proot)
+opencode --help      →  rc=0     (chroot-ng dan proot)
+opencode models      →  rc=139   chroot-ng   ← SIGSEGV, 5 dari 5
+opencode models      →  rc=0     proot
+```
+
+Deterministik, tanpa TTY. `139` = `128 + 11` = `SIGSEGV`.
+
+Awalnya saya mengira ini tekanan memori atau readline. Keduanya sudah dibantah
+dengan pengukuran — `node`, `git`, `bash`, `threading`, `worker_threads`, dan
+`mprotect` semuanya identik antara proot dan chroot-ng. Detail dan daftar
+hipotesis yang sudah gugur ada di
+[troubleshooting.md §2](troubleshooting.md).
+
+Petunjuk terbaru: `opencode` me-spawn server sendiri, dan yang mati adalah
+subproses itu — bukan client-nya. Akar masalahnya belum ditemukan.
+
+**Rekomendasi praktis:** jalankan `opencode` lewat proot. Yang rusak hanya
+lapisan chroot-ng; rootfs-nya sama dan utuh.
+
+Untuk mereproduksi:
+
+```bash
+bash $PREFIX/tmp/repro-opencode.sh
+```
+
+### Tekanan memori bukan penyebabnya
+
+Worth dicatat supaya tidak ditelusuri ulang: device ini memang sedang
+tekanan memori tinggi saat pengujian,
 
 ```
 Mem 7686 MB total · 209 MB free · 1510 MB available
 Swap 4377 MB terpakai dari 7686 MB
 opencode = binary 199.936.296 byte
 ```
+
+tapi itu **bukan** penyebab crash-nya. Buktinya crash-nya deterministik 5 dari
+5 pada kondisi memori yang sama, sementara `node` dan `git` yang jauh lebih
+berat tetap jalan.
 
 Untuk mengaktifkan debug chroot-ng:
 
