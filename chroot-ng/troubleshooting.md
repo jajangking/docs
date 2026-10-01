@@ -21,6 +21,11 @@ Gejala → sebab → solusi. Untuk panduan pemakaian umum lihat
 | Tidak ada output di mode perintah | Sudah diperbaiki: ganti process substitution ke temp file |
 | `PATH` memuat `/data/data/com.termux/...` | Profile proot bocor ke guest. Sudah ada guard, lihat §6 |
 | `container=proot-distro` di dalam chroot-ng | Gejala yang sama. Guard di §6 meng-unset-nya |
+| `Permission denied` saat `uv sync` / `hermes` | Symlink `.l2s` proot menunjuk path host. **Solved** — 22.123 symlink di-rewrite, lihat §8 |
+| `ImportError: cannot import name 'YAML'` | Akibat dari baris di atas: `uv sync` gagal jadi `site-packages` kosong |
+| `ls .l2s` selalu 0 padahal file ada | Normal — isinya dotfile `.l2s.*`. Pakai `ls -a` |
+| `Segmentation fault` saat jalanin `opencode` | **Belum jelas.** Tidak ter-reproduksi dengan harness valid. Curigai memori: 209 MB free, binary 199 MB |
+| `python3` di proot berperilaku aneh | `python3` di `proot-distro login` itu **bionic Termux**, bukan glibc. Lihat §9 |
 
 ---
 
@@ -283,7 +288,98 @@ Kenapa ini penting: `/data/local/tmp` ber-mode `drwxrwx--x shell shell`, jadi
 
 ---
 
-## 8. Diagnosis manual
+## 8. `Permission denied` saat `uv sync` / `hermes`
+
+### Gejala
+
+```
+✗ Installing Python dependencies failed
+    error: Failed to install: packaging-26.0-py3-none-any.whl
+      Caused by: failed to open file
+                 `/root/.hermes/cache/uv/archive-v0/.../WHEEL`:
+                 Permission denied (os error 13)
+```
+
+Disusul `ImportError: cannot import name 'YAML' from 'ruamel.yaml'`. **Satu
+akar masalah, dua gejala** — `uv sync` gagal sehingga `site-packages` tidak
+lengkap, lalu import jadi benar-benar tidak ada.
+
+Penjelasan lengkap ada di [README.md §6](README.md). Ringkasnya:
+
+```
+proot --link2symlink menulis symlink ke path HOST absolut:
+  $RFS/root/.hermes/.../WHEEL -> $RFS/.l2s/.l2s.WHEEL0002
+
+proot    : menerjemahkan -> "Wheel-Version: 1.0"  (OK)
+chroot-ng: baca apa adanya -> /data/data/... tidak ada di guest -> EACCES
+```
+
+### Perbaikan
+
+Rewrite 22.123 symlink dari host-absolute jadi guest-absolute:
+
+```bash
+P=/data/data/com.termux/files/usr
+RFS="$P/var/lib/proot-distro/containers/debian/rootfs"
+
+# 1) backup target asli dulu (WAJIB)
+python3 "$P/tmp/d20.py" backup
+
+# 2) rewrite
+python3 "$P/tmp/d20.py" apply
+
+# 3) verifikasi: harus keluar 0
+python3 "$P/tmp/d20.py" verify
+```
+
+Atau tanpa skrip, kalau mau satu-offs:
+
+```bash
+find "$RFS" -xdev -type l -lname "$RFS/*" -print0 |
+while IFS= read -r -d '' l; do
+  t=$(readlink "$l")
+  case "$t" in "$RFS"/*) ln -sfn "${t#$RFS}" "$l" ;; esac
+done
+```
+
+> **Jangan pakai loop bash untuk 22.000 symlink.** `readlink` per symlink di
+> loop shell butuh ~15 menit untuk 2.689 baris. Versi Python satu `os.walk`
+> selesai dalam **57 detik** untuk backup dan **11 detik** untuk apply.
+
+### Kalau proot malah rusak
+
+Restore dari backup:
+
+```bash
+python3 "$P/tmp/d20.py" restore
+```
+
+Lalu cek symlink sistem tidak ikut berubah:
+
+```bash
+for l in bin/sh lib sbin; do readlink "$RFS/$l"; done
+# harus: dash / usr/lib / usr/sbin
+```
+
+### Kalau muncul lagi setelah `proot-distro install`
+
+`proot-distro` membuat symlink `.l2s` baru dengan bentuk host-path lagi.
+Gejalanya sama: `Permission denied`. Perbaikannya idempoten — jalankan ulang
+langkah di atas.
+
+### Jebakan: `ls .l2s` selalu kosong
+
+Normal, bukan tanda `.l2s` terhapus. Semua entry bernama `.l2s.*` — dotfile,
+yang disembunyikan `ls` tanpa `-a`:
+
+```bash
+ls    "$RFS/.l2s" | wc -l    # 0
+ls -a "$RFS/.l2s" | wc -l    # 15.622
+```
+
+---
+
+## 9. Diagnosis manual
 
 Kalau perlu menelusuri sendiri, tiga perintah ini paling berguna:
 
@@ -316,19 +412,65 @@ Pengujian lewat `adb shell` **wajib** lewat `run-as com.termux` (§7), bukan
 shell adb biasa. Alasannya: `/data/local/tmp` mode `drwxrwx--x shell shell`,
 jadi `uid 2000` tidak bisa membacanya, dan tidak bisa menyentuh `$PREFIX`.
 
-Dua jebakan yang memakan jam debugging:
+### Jebakan yang memakan jam debugging
 
 | Jebakan | Gejala | Solusi |
 |---|---|---|
 | `os.environ.clear()` di harness python | `libtinfo.so.6: cannot open shared object file: Error 38` | Jangan hapus semua env. chroot-ng butuh `LD_LIBRARY_PATH` dari host |
 | Harness tak membersihkan `PROOT_L2S_DIR` / `container` | `dipanggil dari dalam proot` padahal tidak di proot | `os.environ.pop(k, None)` untuk keduanya sebelum `execv` |
+| `proot -r "$RFS"` tanpa bind `/dev`, `/proc` | `can't chdir(...)`, `could not open '/dev/null'`, `tail: not found` | Gunakan `proot-distro login` saja — dia yang pasang bind-nya |
+| `python3` di proot dipakai untuk tes | `ModuleNotFoundError` padahal paket ada | `python3` itu **bionic Termux**. Pakai `proot-distro login debian -- python3` atau path glibc eksplisit |
 
 `Error 38` = ENOSYS, dan itu **artefak harness**, bukan bug chroot-ng. Mode
 perintah yang terlihat "rusak" karena itu sebenarnya sehat.
 
+### Bentuk harness yang benar
+
+```python
+def child_env():
+    # buang HANYA penanda proot, sisanya warisi apa adanya
+    for k in ("PROOT_L2S_DIR", "container"):
+        os.environ.pop(k, None)
+    os.environ["TERM"] = "xterm-256color"
+    os.environ["PREFIX"] = P
+    os.environ["TMPDIR"] = P + "/tmp"
+    os.environ["PATH"] = P + "/bin:/system/bin"
+    # JANGAN os.environ.clear() -- LD_LIBRARY_PATH wajib ada
+```
+
+Matriks yang sudah diuji, supaya tidak perlu mengulang:
+
+| Mode env | Hasil | Arti |
+|---|---|---|
+| warisi apa adanya | guard proot menyala | **paling realistis** — persis seperti shell Termux |
+| `minimal` (tanpa `LD_LIBRARY_PATH`) | `Error 38` ENOSYS | ❌ bukan kontrol yang sah |
+| `clear()` + set env baru | `Error 38` ENOSYS | ❌ bukan kontrol yang sah |
+
+Dua baris bawah penting: harness yang menghapus semua env **bukan kontrol**,
+dan hasilnya tidak boleh dipakai menyimpulkan apa pun. Semua tes yang
+menghasilkan "chroot-ng rusak" pagi itu keliru karena alasan ini.
+
+### Soal `opencode` yang sempat segfault
+
+Dengan harness di atas, `opencode` **tidak** ter-reproduksi: 5 dari 5 kasus
+lolos, termasuk TUI di shell interaktif, tanpa signal. Jadi tidak ada bukti
+chroot-ng penyebabnya.
+
+Yang tersisa sebagai hipotesis: **tekanan memori**.
+
+```
+Mem: 7686 total, 209 free, 1510 available
+Swap: 4377 terpakai dari 7686
+opencode = binary 199.936.296 byte
+```
+
+Kill proses besar dengan sisa 209 MB free memang pantas dicurigai. Tapi
+ini **belum diuji** — belum ada yang mengukur apakah allocate gagal. Jangan
+sebut ini sebagai penyebab sebelum ada datanya.
+
 ---
 
-## 9. Kalau semuanya gagal
+## 10. Kalau semuanya gagal
 
 Kembali ke proot — tidak ada yang hilang, rootfs-nya sama persis:
 

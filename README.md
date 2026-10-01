@@ -16,8 +16,9 @@ Dokumentasi environment perangkat ini.
   pengganti proot: perbedaan mekanisme, install, pemakaian, batasan, dan
   daftar yang sudah diverifikasi.
 - [chroot-ng/troubleshooting.md](chroot-ng/troubleshooting.md) — tabel
-  gejala → solusi, termasuk crash readline pada shell interaktif, akses adb
-  ke sandbox Termux lewat `run-as`, dan diagnosis manual.
+  gejala → solusi, termasuk symlink `.l2s` yang bikin `hermes` gagal,
+  crash readline pada shell interaktif, akses adb ke sandbox Termux lewat
+  `run-as`, cara menguji dengan benar, dan diagnosis manual.
 
 ## Catatan environment
 

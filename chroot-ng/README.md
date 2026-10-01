@@ -37,7 +37,7 @@ rootfs        : 212.355 file
 
 > Angka di atas **proot vs native Termux**, bukan proot vs chroot-ng.
 > Perbandingan proot vs chroot-ng yang valid belum pernah berhasil diukur —
-> lihat §7. Saya tidak akan mengarang angkanya.
+> lihat §8. Saya tidak akan mengarang angkanya.
 
 ---
 
@@ -51,6 +51,7 @@ rootfs        : 212.355 file
 | bash di Termux | ✅ ada (`pkg install bash`) |
 | rootfs Debian via proot-distro | ✅ ada (dipakai bersama proot) |
 | Device mendukung seccomp+SIGSYS | ✅ terverifikasi |
+| Flag `-u` | **bukan** unshare user namespace — itu `--fake-id` |
 
 ### 2.2 Verifikasi capability
 
@@ -69,7 +70,24 @@ primary in-process tier: LIKELY VIABLE
 Kalau `LIKELY VIABLE` tidak muncul, chroot-ng tidak akan bekerja — jangan
 terus mencoba, kembalikan ke proot.
 
-### 2.3 Sumber binary
+### 2.3 Apa arti flag `-u`
+
+Sering disalahpahami. Dari `chroot-ng --help`:
+
+```
+-u, --fake-id[=ID]   Present a fake user identity. ID is a uid or uid:gid
+                     (a bare -u defaults to 0:0, root)
+```
+
+Jadi chroot-ng berjalan dengan **uid host asli** (10496 di perangkat ini) dan
+hanya *berbohong* jadi `0:0` di dalam guest. Tidak ada user namespace, tidak
+ada pemetaan uid.
+
+Konsekuensinya: akses file memakai uid host sebenarnya. Karena seluruh rootfs
+dimiliki uid 10496, baca-tulis di dalam guest berjalan lancar — dan uid root
+di dalam guest **tidak** berarti apa-apa secara privilege di host.
+
+### 2.4 Sumber binary
 
 Binary dibangun dari source, bukan distro package (belum ada paket resmi
 Termux). Yang sudah terpasang di `$PREFIX/bin/chroot-ng` (2.053.208 byte,
@@ -80,9 +98,9 @@ static freestanding aarch64).
 > memakai ejaan `__NR3264_fstat`, sedangkan header Debian mendefinisikan
 > `__NR_fstat 80` langsung. **Nomornya identik, hanya ejaan berbeda.**
 > Compiling file itu manual tanpa `-Werror` membuat build selesai.
-> Ini kandidat PR upstream — lihat §7.
+> Ini kandidat PR upstream — lihat §8.
 
-### 2.4 Pasang wrapper
+### 2.5 Pasang wrapper
 
 Wrapper-nya kompatibel dengan `proot-distro` agar tidak perlu mengingat perintah panjang:
 
@@ -91,7 +109,7 @@ cp /data/local/tmp/wrap2.sh "$PREFIX/bin/chroot-ng-distro"
 chmod 755 "$PREFIX/bin/chroot-ng-distro"
 ```
 
-### 2.5 Alias (opsional, disarankan)
+### 2.6 Alias (opsional, disarankan)
 
 ```bash
 echo "alias cng='$PREFIX/bin/chroot-ng-distro'" >> ~/.bashrc
@@ -163,6 +181,10 @@ Semua ini diuji di rootfs Debian asli perangkat ini, bukan rootfs uji:
 | dynamic loader | resolve path guest dengan benar (`libtinfo.so.6` → `/lib/aarch64-linux-gnu/`) |
 | environment | bersih: hanya `TERM`/`COLORTERM`/`PWD`/`SHLVL`, tanpa `PATH` warisan host |
 | `PATH` di dalam guest | bersih — tidak ada prefix bionic Termux (lihat §5) |
+| symlink `.l2s` | 0 tersisa dari 22.123 yang sebelumnya rusak (lihat §6) |
+| `hermes --version` | `Hermes Agent v0.21.5+5355.g357f51c` |
+| `opencode --version` | `v2.0.21` |
+| `opencode` TUI interaktif | 5/5 lolos, tanpa signal |
 | mode perintah | stabil, noise stderr terfilter |
 | shell interaktif | aman dengan `--noediting` |
 
@@ -227,7 +249,103 @@ Salah urutan menghasilkan error yang menyesatkan seperti
 
 ---
 
-## 6. Kenapa `--noediting` jadi default
+## 6. Symlink `.l2s`: kenapa rootfs awalnya rusak di chroot-ng
+
+Ini temuan paling besar, dan gejalanya baru muncul setelah chroot-ng dipakai
+untuk menjalankan aplikasi nyata (`hermes`), bukan sekadar `git` atau `node`.
+
+### Gejala
+
+```
+✗ Installing Python dependencies failed
+    error: Failed to install: packaging-26.0-py3-none-any.whl
+      Caused by: failed to open file
+                 `/root/.hermes/cache/uv/archive-v0/.../packaging-26.0.dist-info/WHEEL`:
+                 Permission denied (os error 13)
+```
+
+Lalu gejala kedua yang menyamar sebagai bug lain:
+
+```
+ImportError: cannot import name 'YAML' from 'ruamel.yaml' (unknown location)
+```
+
+Itu **satu** masalah, bukan dua. `uv sync` gagal → `site-packages` tidak
+lengkap → import `ruamel.yaml` jadi benar-benar tidak ada. `unknown location`
+adalah ciri package yang gagal dimuat lalu jatuh ke *namespace package*.
+
+### Penyebab
+
+`proot` berjalan dengan emulasi `link2symlink`. Android/host tidak mendukung
+hardlink seperti yang dibutuhkan filesystem rootfs, jadi proot mengganti file
+dengan **symlink ke salinan di direktori `.l2s/`**, dan symlink itu ditulis
+menunjuk **path host absolut**:
+
+```
+$RFS/root/.hermes/cache/uv/archive-v0/.../WHEEL
+    -> /data/data/com.termux/files/usr/var/lib/proot-distro/containers/debian/rootfs/.l2s/.l2s.WHEEL0002
+```
+
+Di bawah **proot** symlink itu diterjemahkan ke path host yang valid, jadi
+`head -1` menghasilkan `Wheel-Version: 1.0`. Di bawah **chroot-ng** symlink
+dibaca apa adanya — dan `/data/data/com.termux/...` **tidak ada di dalam
+guest**, sehingga `Permission denied`.
+
+Skala masalahnya di rootfs ini:
+
+| Metrik | Nilai |
+|---|---|
+| total symlink di rootfs | 28.854 |
+| menunjuk host path (`$RFS/...`) | **22.123** (77%) |
+| menunjuk `/sdcard` | 0 |
+
+Jadi ini bukan isu `hermes`. `hermes` cuma yang paling cepat menampakkannya
+karena `uv` butuh file cache itu saat `sync`.
+
+### Perbaikan
+
+Buang prefix host dari target sehingga jadi **guest-absolute**:
+
+```
+lama: /data/.../containers/debian/rootfs/.l2s/.l2s.WHEEL0002
+baru: /.l2s/.l2s.WHEEL0002
+```
+
+Guest `/` = rootfs di host, jadi bentuk ini benar untuk **kedua** engine.
+Bonus: symlink jadi tahan kalau rootfs dipindah atau di-reinstall
+`proot-distro` — justru path host absolut itulah yang paling rapuh.
+
+22.123 symlink di-rewrite dalam **~11 detik**. Target asli disimpan di
+`$PREFIX/tmp/l2s_targets.bak` sehingga bisa di-restore.
+
+### Verifikasi setelah perubahan
+
+| Cek | Sebelum | Sesudah |
+|---|---|---|
+| symlink host-path tersisa | 22.123 | **0** |
+| `WHEEL` via chroot-ng | `Permission denied` | `Wheel-Version: 1.0` |
+| `WHEEL` via proot | `Wheel-Version: 1.0` | `Wheel-Version: 1.0` |
+| `hermes --version` (chroot-ng) | gagal | `Hermes Agent v0.21.5+5355.g357f51c` |
+| `hermes --version` (proot) | jalan | jalan |
+| `opencode --version` (chroot-ng) | jalan | jalan |
+| `git` / `node` (kedua engine) | jalan | jalan |
+| `container=proot-distro` (proot) | ada | ada |
+| symlink sistem (usr-merge) | utuh | utuh |
+
+> **Symlink sistem tidak tersentuh.** Yang di-rewrite hanya symlink berawalan
+> `$RFS/`. `/bin/sh -> dash`, `/lib -> usr/lib`, `/sbin -> usr/sbin` tetap
+> bentuk aslinya.
+
+### Kalau container di-reinstall
+
+`proot-distro install` akan membuat symlink `.l2s` baru dengan path host
+absolut lagi. Gejalanya: `hermes` di chroot-ng kembali `Permission denied`.
+Perbaikannya idempoten — jalankan ulang skrip rewrite, atau pakai perintah di
+[troubleshooting.md](troubleshooting.md).
+
+---
+
+## 7. Kenapa `--noediting` jadi default
 
 Interaktif dengan readline penuh pernah menghasilkan `Segmentation fault`.
 Setelah pelacakan panjang, penyebabnya **readline** (bukan bash, bukan job
@@ -257,15 +375,33 @@ cng --editing
 
 ---
 
-## 7. Yang belum selesai
+## 8. Yang belum selesai
 
 | Item | Status |
 |---|---|
 | Angka proot vs chroot-ng yang valid | **belum** — yang pernah diukur salah karena di dalam proot |
-| Bug `-Werror` di `unistd_check.c` | **belum** dikirim sebagai PR upstream |
+| Penyebab segfault `opencode` | **belum** — tidak ter-reproduksi dengan harness valid (5/5 lolos). Hipotesis: tekanan memori. Belum diuji |
 | Penyebab segfault readline | **belum** didapat alamat crash (`strace` tidak menangkap `SIGSEGV`) |
+| Bug `-Werror` di `unistd_check.c` | **belum** dikirim sebagai PR upstream |
 | `strace` + core dump | sudah terinstall di rootfs, tapi belum menghasilkan core yang berguna |
 | Test GPU (`vulkaninfo`) | **belum** dikerjakan |
+| Symlink `python3` → `python3.13` | **belum** — tidak mendesak, `hermes` punya python sendiri |
+
+### Tidak ter-reproduksi ≠ selesai
+
+`opencode` sempat keluar `Segmentation fault` sekali di shell interaktif. Setelah
+harness diperbaiki (§9 di [troubleshooting.md](troubleshooting.md)), crash itu
+tidak muncul lagi dalam 5 percobaan — termasuk TUI di interaktif.
+
+Itu **belum berarti selesai**. Harness-nya pty sintetis, bukan terminal Termux
+asli, dan kondisi device saat crash tidak terekam. Yang diketahui hanya: tidak
+ada bukti chroot-ng penyebabnya. Sumber lain yang masuk akal secara fisik:
+
+```
+Mem 7686 MB total · 209 MB free · 1510 MB available
+Swap 4377 MB terpakai dari 7686 MB
+opencode = binary 199.936.296 byte
+```
 
 Untuk mengaktifkan debug chroot-ng:
 
@@ -275,7 +411,7 @@ CNG_DEBUG=1 cng 'echo halo'
 
 ---
 
-## 8. Referensi
+## 9. Referensi
 
 - Source: `fake-chroot-ng` v1.1.0, Apache-2.0, 43k LOC, 336 commit
 - Arsitektur & threat model: `docs/DESIGN.md` di repo upstream
