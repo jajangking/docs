@@ -10,7 +10,7 @@ Gejala → sebab → solusi. Untuk panduan pemakaian umum lihat
 | Gejala | Penyebab & Solusi |
 |---|---|
 | `Segmentation fault` saat masuk shell | Readline crash. **Solved** — default pakai `--noediting`. Paksa: `cng --shell dash` |
-| `Segmentation fault` saat jalanin `opencode` | **Bug chroot-ng, terkonfirmasi** — `rc=139` deterministik. Pakai proot, lihat §2 |
+| `Segmentation fault` saat jalanin `opencode` | **Bug chroot-ng, terkonfirmasi** — `rc=139` deterministik. Crash di **client**, bukan server. Pakai proot, lihat §2 |
 | `dipanggil dari dalam proot` | chroot-ng tidak bisa nested. `exit` dulu ke shell Termux |
 | `rootfs 'debian' tidak ada` | Container hilang. `proot-distro list` untuk cek |
 | `bad interpreter` | bash belum ada di Termux. `pkg install bash` |
@@ -26,7 +26,6 @@ Gejala → sebab → solusi. Untuk panduan pemakaian umum lihat
 | `ImportError: cannot import name 'YAML'` | Akibat dari baris di atas: `uv sync` gagal jadi `site-packages` kosong |
 | `ls .l2s` selalu 0 padahal file ada | Normal — isinya dotfile `.l2s.*`. Pakai `ls -a` |
 | `error: Error building trees` / `garbage: N` | `link2symlink` proot merusak `.git/objects`. Clone ulang, lihat §9 |
-| `Segmentation fault` saat jalanin `opencode` | **Belum jelas.** Tidak ter-reproduksi dengan harness valid. Curigai memori: 209 MB free, binary 199 MB |
 | `python3` di proot berperilaku aneh | `python3` di `proot-distro login` itu **bionic Termux**, bukan glibc. Lihat §10 |
 
 ---
@@ -122,6 +121,10 @@ ia mati.
 | Hipotesis | Cara disprove | Hasil |
 |---|---|---|
 | Tekanan memori | crash deterministik; `node`/`git`/`bash` jalan semua | **bukan** |
+| Subproses server yang crash | `opencode serve` hidup 8 detik; client crash walau server sudah jalan | **bukan** |
+| Jalur penemuan background service | `models --server URL` ke server hidup tetap `139` | **bukan** |
+| Jaringan / Fetch | proxy ke `127.0.0.1:1` menghasilkan `139` yang sama persis | **bukan** |
+| Config / MCP / `auth.json` | di HOME sintetis hasilnya `rc=1`, tidak pernah `139` | **bukan** (lihat §2.1) |
 | `clone3` / thread | `python3` `threading` + `node` `worker_threads` | `THREAD-OK`, `WORKER-OK` |
 | `mprotect` / `execmem` | ukur nilai balik & errno via `ctypes`, 6 putaran | identik proot vs chroot-ng, 6/6 `ret=0` |
 | `ENETDOWN` di trace | `mprotect` nyata tidak menghasilkan errno itu | **artefak strace di bawah seccomp** |
@@ -132,7 +135,10 @@ ia mati.
 > `-f -o` dipakai di bawah seccomp chroot-ng, nilai balik syscall bisa salah
 > tampil — jangan percaya `strace` untuk nilai return di sini.
 
-### Petunjuk terbaru
+### Server bukan pihak yang crash (perbaikan hypothes lama)
+
+Dulu saya tulis di sini bahwa yang mati adalah subproses server. Itu
+**salah**, dan sudah dikoreksi dengan uji langsung.
 
 `opencode` bukan single-process; ia me-spawn **server** sendiri. Dengan
 `HOME` kosong error-nya jadi berbeda:
@@ -143,11 +149,70 @@ Error: Server process exited with code 127
 ```
 
 `127` = "command not found" — server-nya tidak ditemukan karena konfigurasi
-hilang. Dengan `HOME` asli, server **ditemukan**, lalu **crash 139**. Jadi
-yang mati adalah subproses server, bukan client-nya.
+hilang. Itu **error bersih di level JavaScript**, bukan crash.
 
-Ini masih petunjuk, belum jawaban. Yang belum diperiksa: apa persis yang
-di-`execve` saat spawn, dan apakah `opencode serve` sendiri bisa hidup.
+Untuk tahu pihak mana yang crash, server dijalankan lebih dulu, lalu client
+disambungkan:
+
+| Skenario | Hasil |
+|---|---|
+| `opencode serve` sendirian, 8 detik | **masih hidup** ✅ |
+| `models`, client spawn server sendiri | `rc=139` |
+| `models`, server sudah jalan lebih dulu | **`rc=139`** |
+| `models --server http://127.0.0.1:4096` ke server yang hidup | **`rc=139`** |
+| proot, semua skenario di atas | `rc=0` ✅ |
+
+Pada skenario ketiga dan keempat, `bash` melaporkan `Segmentation fault`
+untuk **PID client**, sementara PID server tetap jalan. Jadi:
+
+- Yang crash adalah **client**-nya.
+- Jalur penemuan background service **bukan** penyebabnya — client tetap
+  crash meski disambungkan eksplisit ke server yang terbukti hidup.
+- Server bisa hidup 8 detik di bawah chroot-ng, jadi spawn-nya sendiri
+  tidak rusak.
+
+### Bukan masalah jaringan
+
+`models`, `auth list`, dan `stats` menghasilkan `rc=139` yang persis sama
+dengan proxy diarahkan ke `127.0.0.1:1` (port mati). Crash terjadi tanpa
+perlu ada koneksi apa pun.
+
+### Crash sangat dini
+
+```
+$ opencode models --print-logs --log-level trace
+rc=139
+jumlah baris log: 0
+```
+
+Nol baris log: crash terjadi **sebelum logging terpasang**. Itu menjauhkan
+dari Fetch/HTTP, dan konsisten dengan `139` muncul di setiap perintah yang
+mulai bekerja (`models`, `auth list`, `stats`) dan tidak muncul di yang
+sekadar membaca header binary (`--version`, `--help`).
+
+### Varian command
+
+| Perintah | chroot-ng | Catatan |
+|---|---|---|
+| `--version` | `0` ✅ | hanya baca header binary |
+| `--help` | `0` ✅ | |
+| `models` | **`139`** | crash, tanpa output |
+| `auth list` | **`139`** | crash, tanpa output |
+| `stats` | **`139`** | crash, tanpa output |
+| `agent list` | `1` | **perintah tidak dikenal** — jatuh ke help |
+| `--standalone models` | `1` | flag salah posisi → help |
+| `models --standalone` | `1` | `Standalone server exited before reporting readiness` |
+| `models --server URL` | **`139`** | tetap crash |
+
+Dua baris `rc=1` itu **bukan** pembeda yang berguna: keduanya adalah
+kesalahan pemakaian atau kegagalan yang tertangani rapi, bukan pekerjaan
+nyata yang berhasil. `agent list` sempat saya kira error bersih atas
+pekerjaan nyata — itu keliru, `agent` memang bukan subcommand.
+
+Yang menarik: `models --standalone` **tidak** crash, hanya melaporkan
+`Standalone server exited before reporting readiness` dengan `rc=1`. Jadi
+jalur `--standalone` punya kode penanganan kegagalan yang berfungsi, dan
+perbedaannya dengan jalur default adalah tempat di mana crash terjadi.
 
 ### Untuk mereproduksi ulang
 
@@ -157,6 +222,51 @@ bash $PREFIX/tmp/repro-opencode.sh
 
 Keluar 0 = bug terkonfirmasi. Keluar 1 = tidak tereproduksi (kemungkinan sudah
 diperbaiki chroot-ng).
+
+### 2.1 Config, MCP, dan `auth.json` bukan pemicu
+
+`HOME` kosong menghasilkan `rc=1` (error bersih), sementara `HOME=/root`
+asli menghasilkan `rc=139`. ItuKESALAHAN: kalau pemicunya ada di dalam
+`HOME`, maka setiap `HOME` sintetis seharusnya bisa Somewhere menghasilkan
+crash.
+
+Isi `HOME` yang diperiksa, semuanya **hanya dibaca**, tidak pernah diubah:
+
+| Bagian | Isi | Ditemukan |
+|---|---|---|
+| `.config/opencode/opencode.json` | 272 byte, mendaftarkan MCP `mobile-mcp` | ada |
+| `.config/opencode/service.json` | hanya `{"password": "..."}` | ada |
+| `.local/share/opencode/auth.json` | — | **tidak ada sama sekali** |
+| `.local/share/opencode/opencode.db` | 15.798.272 byte SQLite | ada |
+| `opencode.db-wal` | 9.360.672 byte | ada |
+| `opencode.db-shm` | 32.768 byte | ada |
+
+Hasil percobaan dengan `HOME` sintetis di `/root/tmp`:
+
+| `HOME` | rc |
+|---|---|
+| kosong total | `1` |
+| config minimal tanpa MCP | `1` |
+| config asli apa adanya | `1` |
+| config asli tanpa blok `mcp` | `1` |
+| tanpa config, dengan `opencode.db*` | `1` |
+| config + `service.json` + `opencode.db*` | `1` |
+| **`HOME=/root` (asli, kontrol)** | **`139`** |
+
+Semua varian sintetis gagal **lebih awal**, di tahap spawn, dengan
+`Error: Server process exited with code 127` — belum pernah menyentuh
+tahap tempat crash terjadi. Jadi tabel ini belum menyingkirkan apa pun
+tentang isi `HOME`; ia hanya menunjukkan bahwa `rc=127` itu kemacetan
+tahap spawn, bukan crash yang sama.
+
+Dua kemungkinan yang belum dipisah:
+
+- `opencode` mencari binary service di `$HOME/.opencode/bin/opencode`, dan
+  HOME sintetis tidak punya `~/.opencode` (191 MB, tidak disalin).
+- `opencode` memakai `/root` secara absolut di suatu tempat.
+
+Pemeriksaan lanjutan harus menyambungkan `~/.opencode` sebagai symlink
+lalu mengulang bisect. Itu belum sempat menghasilkan hasil.
 
 ### Yang bisa dilakukan sekarang
 

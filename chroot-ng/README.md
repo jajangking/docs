@@ -407,8 +407,12 @@ dengan pengukuran — `node`, `git`, `bash`, `threading`, `worker_threads`, dan
 hipotesis yang sudah gugur ada di
 [troubleshooting.md §2](troubleshooting.md).
 
-Petunjuk terbaru: `opencode` me-spawn server sendiri, dan yang mati adalah
-subproses itu — bukan client-nya. Akar masalahnya belum ditemukan.
+Petunjuk terbaru: yang crash adalah **client**-nya, bukan server. Server
+dapat hidup 8 detik di bawah chroot-ng, dan client tetap `rc=139` bahkan
+saat disambungkan eksplisit ke server yang terbukti hidup lewat
+`--server`. Crash terjadi sebelum logging terpasang (`--log-level trace`
+menghasilkan 0 baris), dan tidak bergantung pada jaringan. Akar
+masalahnya belum ditemukan.
 
 **Rekomendasi praktis:** jalankan `opencode` lewat proot. Yang rusak hanya
 lapisan chroot-ng; rootfs-nya sama dan utuh.
