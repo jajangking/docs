@@ -24,6 +24,7 @@ Gejala → sebab → solusi. Untuk panduan pemakaian umum lihat
 | `Permission denied` saat `uv sync` / `hermes` | Symlink `.l2s` proot menunjuk path host. **Solved** — 22.123 symlink di-rewrite, lihat §8 |
 | `ImportError: cannot import name 'YAML'` | Akibat dari baris di atas: `uv sync` gagal jadi `site-packages` kosong |
 | `ls .l2s` selalu 0 padahal file ada | Normal — isinya dotfile `.l2s.*`. Pakai `ls -a` |
+| `error: Error building trees` / `garbage: N` | `link2symlink` proot merusak `.git/objects`. Clone ulang, lihat §8 |
 | `Segmentation fault` saat jalanin `opencode` | **Belum jelas.** Tidak ter-reproduksi dengan harness valid. Curigai memori: 209 MB free, binary 199 MB |
 | `python3` di proot berperilaku aneh | `python3` di `proot-distro login` itu **bionic Termux**, bukan glibc. Lihat §9 |
 
@@ -376,6 +377,68 @@ yang disembunyikan `ls` tanpa `-a`:
 ls    "$RFS/.l2s" | wc -l    # 0
 ls -a "$RFS/.l2s" | wc -l    # 15.622
 ```
+
+### `.git/objects` ikut rusak — `link2symlink` merusak repo git
+
+`link2symlink` proot tidak hanya menyentuh file aplikasi. Ia juga mengganti
+objek git jadi symlink `.l2s`, karena `.git/objects` dipenuhi file kecil.
+
+git masih bisa **membaca** objek lewat symlink yang resolve, tapi **menolak
+memakainya** saat membangun tree:
+
+```
+error: invalid object 100644 2011352... for 'hermes/README.md'
+error: Error building trees
+```
+
+Dan `git count-objects -v` menandainya:
+
+```
+count: 4
+garbage: 12        <-- objek symlink, bukan file biasa
+size-garbage: 16
+```
+
+Terjadi di repo `/root/docs` **dan** di repo hermes:
+
+| Repo | file asli | symlink |
+|---|---|---|
+| `/root/docs/.git/objects` | 4 | 12 |
+| `/root/.hermes/hermes-agent/.git/objects` | 11 | **33** |
+
+`hermes-agent` lebih parah — itu repo yang dipakai `hermes update`, jadi
+`hermes update` bisa gagal.
+
+**Gejalanya tidak konsisten.** Commit biasa sering lolos; yang gagal biasanya
+saat objek yang dipakai ulang. `git status` yang hijau belum berarti aman.
+
+### Solusi
+
+Clone ulang. Isi worktree biasanya utuh — yang rusak hanya `.git/objects`:
+
+```bash
+mkdir -p /tmp/save && cp -r /root/docs/* /tmp/save/
+cd /root && rm -rf docs
+git clone https://github.com/<kamu>/docs.git docs
+cp -r /tmp/save/. /root/docs/
+cd /root/docs && git add -A && git commit
+```
+
+Setelah clone ulang, pastikan bersih:
+
+```bash
+git count-objects -v | grep garbage
+# harus: garbage: 0
+```
+
+Kalau masih ada garbage, ulangi clone. Clone dari remote selalu menghasilkan
+objek asli, karena yang di-push ke server adalah isi file, bukan symlinknya.
+
+### Mencegah
+
+Simpan repo git **di luar** rootfs yang dikelola proot. `/root/docs` dan
+`/root/.hermes` keduanya di dalam, jadi keduanya rentan. `link2symlink` hanya
+beracting di dalam rootfs — repo di `$HOME` Termux tidak kena.
 
 ---
 
