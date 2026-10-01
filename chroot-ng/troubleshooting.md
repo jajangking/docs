@@ -124,7 +124,10 @@ ia mati.
 | Subproses server yang crash | `opencode serve` hidup 8 detik; client crash walau server sudah jalan | **bukan** |
 | Jalur penemuan background service | `models --server URL` ke server hidup tetap `139` | **bukan** |
 | Jaringan / Fetch | proxy ke `127.0.0.1:1` menghasilkan `139` yang sama persis | **bukan** |
-| Config / MCP / `auth.json` | di HOME sintetis hasilnya `rc=1`, tidak pernah `139` | **bukan** (lihat §2.1) |
+| Config / MCP / `auth.json` | `/root2` tanpa `.config/opencode` tetap `139` | **bukan** (§2.1) |
+| SQLite `opencode.db*` | `/root2` tanpa `opencode.db*` tetap `139` | **bukan** (§2.2) |
+| `.cache` | `/root2` tanpa `.cache` tetap `139` | **bukan** (§2.2) |
+| Direktori kerja (cwd) | 4 cwd berbeda, semuanya `139` | **bukan** (§2.3) |
 | `clone3` / thread | `python3` `threading` + `node` `worker_threads` | `THREAD-OK`, `WORKER-OK` |
 | `mprotect` / `execmem` | ukur nilai balik & errno via `ctypes`, 6 putaran | identik proot vs chroot-ng, 6/6 `ret=0` |
 | `ENETDOWN` di trace | `mprotect` nyata tidak menghasilkan errno itu | **artefak strace di bawah seccomp** |
@@ -135,7 +138,7 @@ ia mati.
 > `-f -o` dipakai di bawah seccomp chroot-ng, nilai balik syscall bisa salah
 > tampil — jangan percaya `strace` untuk nilai return di sini.
 
-### Server bukan pihak yang crash (perbaikan hypothes lama)
+### Server bukan pihak yang crash (koreksi hipotesis lama)
 
 Dulu saya tulis di sini bahwa yang mati adalah subproses server. Itu
 **salah**, dan sudah dikoreksi dengan uji langsung.
@@ -226,9 +229,8 @@ diperbaiki chroot-ng).
 ### 2.1 Config, MCP, dan `auth.json` bukan pemicu
 
 `HOME` kosong menghasilkan `rc=1` (error bersih), sementara `HOME=/root`
-asli menghasilkan `rc=139`. ItuKESALAHAN: kalau pemicunya ada di dalam
-`HOME`, maka setiap `HOME` sintetis seharusnya bisa Somewhere menghasilkan
-crash.
+asli menghasilkan `rc=139`. Kalau pemicunya ada di dalam `HOME`, maka
+setiap `HOME` sintetis seharusnya bisa menghasilkan crash.
 
 Isi `HOME` yang diperiksa, semuanya **hanya dibaca**, tidak pernah diubah:
 
@@ -259,14 +261,64 @@ tahap tempat crash terjadi. Jadi tabel ini belum menyingkirkan apa pun
 tentang isi `HOME`; ia hanya menunjukkan bahwa `rc=127` itu kemacetan
 tahap spawn, bukan crash yang sama.
 
-Dua kemungkinan yang belum dipisah:
+### 2.2 Bisect dari arah `/root` sendiri
 
-- `opencode` mencari binary service di `$HOME/.opencode/bin/opencode`, dan
-  HOME sintetis tidak punya `~/.opencode` (191 MB, tidak disalin).
-- `opencode` memakai `/root` secara absolut di suatu tempat.
+Arah dibalik: alih-alih merakit `HOME` sintetis dari bawah, `/root` penuh
+disalin ke `/root2` (2,0 GB, 117 detik, `rc=0`) lalu dipangkas bertahap.
+`/root` asli tidak pernah diubah, dan `/root2` dihapus setelah selesai.
 
-Pemeriksaan lanjutan harus menyambungkan `~/.opencode` sebagai symlink
-lalu mengulang bisect. Itu belum sempat menghasilkan hasil.
+Kontrol: replika penuh `/root2` menghasilkan **`rc=139`**. Crash bisa
+direproduksi di salinan, jadi pemangkasan berikutnya memang menyisakan
+variabel yang benar.
+
+| Yang dibuang dari `/root2` | rc | Arti |
+|---|---|---|
+| — (replika penuh, kontrol) | **`139`** | ✅ crash tereproduksi |
+| `.local/share/opencode/opencode.db*` | **`139`** | sqlite bukan pemicu |
+| `.config/opencode` | **`139`** | config bukan pemicu |
+| `.opencode` → symlink ke asli | **`139`** | bukan soal `.opencode` |
+| `.cache` | **`139`** | cache bukan pemicu |
+| `.local` (seluruhnya) | `1` | `rc=127`, macet di tahap spawn |
+| `.bashrc` + `.profile` | `1` | `rc=127`, macet di tahap spawn |
+
+Jadi **config, MCP, sqlite, cache, dan `.opencode` semuanya gugur**. Yang
+tersisa hanya dua kandidat: isi `.local`, dan dotfile shell.
+
+> Penting soal cara membaca tabel ini: perubahan `139` → `1` **bukan**
+> berarti "crash hilang". `rc=1` di sini adalah
+> `Error: Server process exited with code 127` — prosesnya berhenti sebelum
+> mencapai tahap crash. Artinya bagian itu dibutuhkan agar *sampai* ke
+> titik crash, bukan untuk *menghindari* crash.
+
+### 2.3 cwd bukan pemicu
+
+`opencode` mencari `.opencode/` di direktori kerja, jadi `cwd` layak
+diuji. Hasilnya: `139` di semua lokasi.
+
+| `HOME` | cwd | rc |
+|---|---|---|
+| `/root` | `/root` | **`139`** |
+| `/root` | `/tmp` | **`139`** |
+| `/root` | `/tmp/empty-dir` | **`139`** |
+| `/root` | `/root/docs` | **`139`** |
+
+Kontrol di baris pertama mengulang hasil yang sama seperti sebelumnya, jadi
+percobaan ini sah dan `cwd` gugur.
+
+### 2.4 Dua kandidat yang tersisa
+
+1. **Isi `.local`** — belum dipisah per subdirektori (`share`, `bin`,
+   `state`, `lib`), dan belum dipisah `share/opencode` dari `share` lain.
+2. **Dotfile shell** — `.bashrc` dan `.profile`.
+
+Dua catatan kehati-hatian yang perlu diingat kalau mengulang:
+
+- Langkah harus **memverifikasi pemulihan** bahwa `rc` kembali ke `139` sebelum
+  lanjut ke kandidat berikutnya. Tanpa itu, satu langkah yang gagal
+  memulihkan state akan mengotori semua hasil setelahnya.
+- Salinan harus dicek masih ada **sebelum** dibaca. Di satu percobaan,
+  `/root2` sudah dihapus di langkah akhir tetapi tetap dipakaikan untuk
+  `ls`, dan hasilnya kosong — itu sempat terbaca sebagai "tidak ada isi".
 
 ### Yang bisa dilakukan sekarang
 
